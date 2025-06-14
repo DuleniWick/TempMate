@@ -1,6 +1,6 @@
-# TempMate
+# TempMate ☕
 TempMate is a smart temperature-regulating mug that keeps your drink at the perfect sipping temperature. It uses temperature sensors and PWM control to apply just the right amount of heat—saving battery and keeping your drink warm without overheating. Compact and portable, it’s perfect for enjoying hot drinks anywhere, anytime.
-# TempMate ☕  
+ 
 **Smart Temperature-Regulating Mug**
 
 TempMate is a compact, portable smart mug that keeps your drink at the perfect sipping temperature—anytime, anywhere. Using intelligent temperature sensing and PWM-based control, it ensures your beverage stays warm without overheating or wasting battery.
@@ -22,8 +22,8 @@ TempMate is a compact, portable smart mug that keeps your drink at the perfect s
 
 1. **Temperature Sensor**: Continuously monitors the drink's temperature.
 2. **Microcontroller**: Processes temperature data and adjusts power delivery.
-3. **PWM Control**: Applies just enough heat to maintain desired temperature without boiling.
-4. **Feedback Loop**: Automatically adjusts heating to preserve beverage quality and battery life.
+3. **PWM Control with MOSFET Switching**: A power MOSFET is used to switch the heating element on and off rapidly using Pulse Width Modulation (PWM), delivering just enough energy to maintain the desired temperature.
+4. **Feedback Loop**: Automatically adjusts heating in real time to preserve beverage quality and extend battery life.
 
 ---
 
@@ -31,15 +31,12 @@ TempMate is a compact, portable smart mug that keeps your drink at the perfect s
 
 - Microcontroller (Arduino Uno)
 - NTC Thermistor or Digital Temperature Sensor (e.g., DS18B20)
-- Heating Element (e.g., flexible heater pad)
-- Power Source (Li-ion battery or USB)
-- PWM Control Circuitry
+- Heating Element 
+- Power MOSFET (IRF540N ) for PWM switching
+- Power Source (Li-ion battery)
+- Basic passive components (resistors, capacitors)
 
 ---
 
-## 🚀 Getting Started
 
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/yourusername/tempmate.git
-   cd tempmate
+
