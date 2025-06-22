@@ -1,0 +1,402 @@
+/*
+ * Smart Mug System - Register Level AVR C for Arduino Nano (ATmega328P)
+ *
+ * - DS18B20 on PB5 (D13, bit-banged 1-Wire)
+ * - Push button on PD2 (D2, INT0)
+ * - Heater PWM on PD3 (D3, OC2B, Timer2)
+ * - OLED SSD1306 on I2C (PC4/PC5, 0x3C)
+ * - 16 MHz F_CPU
+ *
+ * For Microchip Studio (AVR-GCC)
+ */
+
+#define F_CPU 16000000UL
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+// ====== PIN DEFINITIONS ======
+#define DS18B20_DDR  DDRB
+#define DS18B20_PORT PORTB
+#define DS18B20_PIN  PINB
+#define DS18B20_BIT  PB5
+
+#define BUTTON_DDR   DDRD
+#define BUTTON_PORT  PORTD
+#define BUTTON_PIN   PIND
+#define BUTTON_BIT   PD2
+
+#define HEATER_DDR   DDRD
+#define HEATER_PORT  PORTD
+#define HEATER_BIT   PD3 // OC2B
+
+// ====== OLED SSD1306 I2C (TWI) ======
+#define OLED_ADDR 0x3C
+
+// ====== TEMPERATURE MODES ======
+#define MODE_LOW 50
+#define MODE_MEDIUM 55
+#define MODE_HIGH 60
+#define TEMP_THRESHOLD 10
+
+// ====== PID PARAMETERS ======
+#define KP 5.0
+#define KI 0.8
+#define KD 2.5
+
+// ====== TIMING ======
+#define PID_INTERVAL_MS 500
+#define DISPLAY_INTERVAL_MS 500
+#define BUTTON_DEBOUNCE_MS 200
+
+// ====== GLOBAL STATE ======
+typedef enum { LOW_MODE, MEDIUM_MODE, HIGH_MODE } Mode;
+volatile Mode currentMode = MEDIUM_MODE;
+volatile double setpoint = MODE_MEDIUM;
+volatile double currentTemp = 0.0;
+volatile double pwmOutput = 0.0;
+volatile bool sensorConnected = true;
+volatile bool heaterEnabled = false;
+
+// PID state
+volatile double prevError = 0.0;
+volatile double integral = 0.0;
+
+// Button debounce
+volatile uint32_t lastButtonTime = 0;
+volatile uint8_t lastButtonState = 1;
+
+// ====== UTILITY ======
+uint32_t millis(void) {
+    // Simple millis using Timer0 (8-bit, prescaler 64)
+    // 16MHz/64 = 250kHz, 1ms = 250 cycles, overflow every 256 ticks
+    static uint32_t ms = 0;
+    static uint8_t last_tcnt0 = 0;
+    uint8_t tcnt0 = TCNT0;
+    ms += (uint8_t)(tcnt0 - last_tcnt0) / 250;
+    last_tcnt0 = tcnt0;
+    return ms;
+}
+
+// ====== 1-WIRE BIT-BANG FOR DS18B20 ======
+void oneWireWriteBit(uint8_t bit) {
+    DS18B20_DDR |= (1 << DS18B20_BIT);
+    if (bit) {
+        DS18B20_PORT &= ~(1 << DS18B20_BIT);
+        _delay_us(6);
+        DS18B20_DDR &= ~(1 << DS18B20_BIT);
+        _delay_us(64);
+    } else {
+        DS18B20_PORT &= ~(1 << DS18B20_BIT);
+        _delay_us(60);
+        DS18B20_DDR &= ~(1 << DS18B20_BIT);
+        _delay_us(10);
+    }
+}
+
+uint8_t oneWireReadBit(void) {
+    uint8_t bit;
+    DS18B20_DDR |= (1 << DS18B20_BIT);
+    DS18B20_PORT &= ~(1 << DS18B20_BIT);
+    _delay_us(6);
+    DS18B20_DDR &= ~(1 << DS18B20_BIT);
+    _delay_us(9);
+    bit = (DS18B20_PIN & (1 << DS18B20_BIT)) ? 1 : 0;
+    _delay_us(55);
+    return bit;
+}
+
+void oneWireWriteByte(uint8_t byte) {
+    for (uint8_t i = 0; i < 8; i++) {
+        oneWireWriteBit(byte & 0x01);
+        byte >>= 1;
+    }
+}
+
+uint8_t oneWireReadByte(void) {
+    uint8_t byte = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (oneWireReadBit()) byte |= (1 << i);
+    }
+    return byte;
+}
+
+uint8_t oneWireReset(void) {
+    uint8_t r;
+    DS18B20_DDR |= (1 << DS18B20_BIT);
+    DS18B20_PORT &= ~(1 << DS18B20_BIT);
+    _delay_us(480);
+    DS18B20_DDR &= ~(1 << DS18B20_BIT);
+    _delay_us(70);
+    r = (DS18B20_PIN & (1 << DS18B20_BIT)) ? 0 : 1;
+    _delay_us(410);
+    return r;
+}
+
+// Read temperature from DS18B20 (returns Celsius * 16, or 0x8000 on error)
+int16_t ds18b20_read_raw(void) {
+    if (!oneWireReset()) return 0x8000;
+    oneWireWriteByte(0xCC); // Skip ROM
+    oneWireWriteByte(0x44); // Convert T
+    _delay_ms(750); // Max conversion time
+    if (!oneWireReset()) return 0x8000;
+    oneWireWriteByte(0xCC); // Skip ROM
+    oneWireWriteByte(0xBE); // Read Scratchpad
+    uint8_t lsb = oneWireReadByte();
+    uint8_t msb = oneWireReadByte();
+    return (msb << 8) | lsb;
+}
+
+double ds18b20_read_celsius(void) {
+    int16_t raw = ds18b20_read_raw();
+    if (raw == 0x8000) return -1000.0;
+    return (double)raw / 16.0;
+}
+
+// ====== BUTTON HANDLING ======
+void button_init(void) {
+    BUTTON_DDR &= ~(1 << BUTTON_BIT); // Input
+    BUTTON_PORT |= (1 << BUTTON_BIT); // Pull-up
+}
+
+uint8_t button_read(void) {
+    return (BUTTON_PIN & (1 << BUTTON_BIT)) ? 1 : 0;
+}
+
+void cycleMode(void) {
+    switch (currentMode) {
+        case LOW_MODE:
+            currentMode = MEDIUM_MODE;
+            setpoint = MODE_MEDIUM;
+            break;
+        case MEDIUM_MODE:
+            currentMode = HIGH_MODE;
+            setpoint = MODE_HIGH;
+            break;
+        case HIGH_MODE:
+            currentMode = LOW_MODE;
+            setpoint = MODE_LOW;
+            break;
+    }
+    integral = 0.0;
+    prevError = 0.0;
+}
+
+// ====== HEATER PWM (TIMER2, OC2B, PD3) ======
+void heater_pwm_init(void) {
+    HEATER_DDR |= (1 << HEATER_BIT); // Output
+    // Fast PWM, non-inverting, prescaler 64
+    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20);
+    TCCR2B = (1 << CS22); // prescaler 64
+    OCR2B = 0;
+}
+
+void heater_pwm_set(uint8_t value) {
+    OCR2B = value;
+}
+
+// ====== TWI (I2C) FOR OLED ======
+void twi_init(void) {
+    // 100kHz @ 16MHz
+    TWSR = 0x00;
+    TWBR = 72;
+}
+
+void twi_start(void) {
+    TWCR = (1 << TWSTA) | (1 << TWEN) | (1 << TWINT);
+    while (!(TWCR & (1 << TWINT)));
+}
+
+void twi_stop(void) {
+    TWCR = (1 << TWSTO) | (1 << TWEN) | (1 << TWINT);
+    _delay_us(10);
+}
+
+void twi_write(uint8_t data) {
+    TWDR = data;
+    TWCR = (1 << TWEN) | (1 << TWINT);
+    while (!(TWCR & (1 << TWINT)));
+}
+
+// ====== SSD1306 OLED BASIC COMMANDS ======
+void oled_command(uint8_t cmd) {
+    twi_start();
+    twi_write((OLED_ADDR << 1) | 0); // Write
+    twi_write(0x00); // Co = 0, D/C# = 0
+    twi_write(cmd);
+    twi_stop();
+}
+
+void oled_data(uint8_t *data, uint16_t len) {
+    twi_start();
+    twi_write((OLED_ADDR << 1) | 0);
+    twi_write(0x40); // Co = 0, D/C# = 1
+    for (uint16_t i = 0; i < len; i++) {
+        twi_write(data[i]);
+    }
+    twi_stop();
+}
+
+void oled_init(void) {
+    _delay_ms(100);
+    oled_command(0xAE); // Display off
+    oled_command(0xD5); oled_command(0x80);
+    oled_command(0xA8); oled_command(0x3F);
+    oled_command(0xD3); oled_command(0x00);
+    oled_command(0x40);
+    oled_command(0x8D); oled_command(0x14);
+    oled_command(0x20); oled_command(0x00);
+    oled_command(0xA1);
+    oled_command(0xC8);
+    oled_command(0xDA); oled_command(0x12);
+    oled_command(0x81); oled_command(0xCF);
+    oled_command(0xD9); oled_command(0xF1);
+    oled_command(0xDB); oled_command(0x40);
+    oled_command(0xA4);
+    oled_command(0xA6);
+    oled_command(0xAF); // Display on
+}
+
+void oled_clear(void) {
+    uint8_t zero[128] = {0};
+    for (uint8_t page = 0; page < 8; page++) {
+        oled_command(0xB0 | page);
+        oled_command(0x00);
+        oled_command(0x10);
+        oled_data(zero, 128);
+    }
+}
+
+// Simple 5x7 font (ASCII 32-127)
+extern const uint8_t font5x7[];
+void oled_set_cursor(uint8_t col, uint8_t page) {
+    oled_command(0xB0 | page);
+    oled_command(0x00 | (col & 0x0F));
+    oled_command(0x10 | (col >> 4));
+}
+
+void oled_print(const char *str, uint8_t col, uint8_t page) {
+    oled_set_cursor(col, page);
+    while (*str) {
+        if (*str < 32 || *str > 127) {
+            str++;
+            continue;
+        }
+        uint16_t idx = (*str - 32) * 5;
+        oled_data((uint8_t*)&font5x7[idx], 5);
+        uint8_t space = 0x00;
+        oled_data(&space, 1);
+        str++;
+    }
+}
+
+// ====== MAIN LOGIC ======
+int main(void) {
+    // Init
+    button_init();
+    heater_pwm_init();
+    twi_init();
+    oled_init();
+    oled_clear();
+    sei();
+
+    char line[32];
+    uint32_t lastPid = 0, lastDisplay = 0;
+    double error, derivative, deltaTime;
+    char modeStr[8] = "MEDIUM";
+    char statusMsg[22] = "";
+
+    while (1) {
+        // --- Button handling (debounced) ---
+        uint8_t buttonState = button_read();
+        uint32_t now = millis();
+        if (buttonState != lastButtonState) {
+            if (now - lastButtonTime > BUTTON_DEBOUNCE_MS) {
+                if (buttonState == 0) { // Pressed
+                    cycleMode();
+                    switch (currentMode) {
+                        case LOW_MODE: strcpy(modeStr, "LOW"); break;
+                        case MEDIUM_MODE: strcpy(modeStr, "MEDIUM"); break;
+                        case HIGH_MODE: strcpy(modeStr, "HIGH"); break;
+                    }
+                }
+                lastButtonTime = now;
+            }
+            lastButtonState = buttonState;
+        }
+
+        // --- Temperature reading ---
+        double temp = ds18b20_read_celsius();
+        if (temp < -100.0) {
+            sensorConnected = false;
+            strcpy(statusMsg, "Sensor Error");
+            heaterEnabled = false;
+            pwmOutput = 0;
+        } else {
+            sensorConnected = true;
+            currentTemp = temp;
+            if (currentTemp < setpoint - TEMP_THRESHOLD) {
+                strcpy(statusMsg, "Too cold! Can't heat");
+                heaterEnabled = false;
+                pwmOutput = 0;
+            } else if (currentTemp > setpoint) {
+                strcpy(statusMsg, "Too hot! Wait to cool");
+                heaterEnabled = false;
+                pwmOutput = 0;
+            } else {
+                strcpy(statusMsg, "Heating...");
+                heaterEnabled = true;
+            }
+        }
+
+        // --- PID update ---
+        if (now - lastPid > PID_INTERVAL_MS) {
+            if (sensorConnected && heaterEnabled) {
+                error = setpoint - currentTemp;
+                deltaTime = (double)(PID_INTERVAL_MS) / 1000.0;
+                integral += error * deltaTime;
+                if (integral > 255.0 / KI) integral = 255.0 / KI;
+                if (integral < -255.0 / KI) integral = -255.0 / KI;
+                derivative = (error - prevError) / deltaTime;
+                pwmOutput = KP * error + KI * integral + KD * derivative;
+                if (pwmOutput > 255) pwmOutput = 255;
+                if (pwmOutput < 0) pwmOutput = 0;
+                prevError = error;
+            } else {
+                pwmOutput = 0;
+            }
+            heater_pwm_set((uint8_t)pwmOutput);
+            lastPid = now;
+        }
+
+        // --- Display update ---
+        if (now - lastDisplay > DISPLAY_INTERVAL_MS) {
+            oled_clear();
+            // Line 1: Temp
+            snprintf(line, sizeof(line), "Temp: %.1fC", currentTemp);
+            oled_print(line, 0, 0);
+            // Line 2: Setpoint and mode
+            snprintf(line, sizeof(line), "Set: %.0fC (%s)", setpoint, modeStr);
+            oled_print(line, 0, 1);
+            // Line 3: PWM
+            snprintf(line, sizeof(line), "PWM: %d/255", (int)pwmOutput);
+            oled_print(line, 0, 2);
+            // Line 4: Status
+            oled_print(statusMsg, 0, 3);
+            // Line 5: Heater
+            oled_print(heaterEnabled ? "Heater: ON" : "Heater: OFF", 0, 4);
+            // Line 6: Sensor
+            oled_print(sensorConnected ? "Sensor: OK" : "Sensor: ERROR", 0, 5);
+            lastDisplay = now;
+        }
+    }
+}
+
+// ====== 5x7 FONT DATA (ASCII 32-127) ======
+// (You can use a standard 5x7 font array here, omitted for brevity)
+const uint8_t font5x7[] = {
+    // ... font data ...
+}; 
