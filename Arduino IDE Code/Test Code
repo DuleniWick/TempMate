@@ -1,1 +1,135 @@
+// ====== LIBRARIES ======
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ====== CONFIGURATION ======
+#define HEATER_PWM_PIN 3        // Heater output PWM pin
+#define TEMP_SENSOR_PIN 13      // DS18B20 data pin
+#define BUTTON_PIN 2            // Push button pin
+#define SCREEN_WIDTH 128        // OLED width
+#define SCREEN_HEIGHT 64        // OLED height
+#define OLED_RESET -1           // OLED reset not used
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+OneWire oneWire(TEMP_SENSOR_PIN);
+DallasTemperature sensors(&oneWire);
+
+// ====== TEMPERATURE CONTROL ======
+double setpoint = 55.0;         // Default to Medium Mode
+double currentTemp = 0.0;
+double pwmOutput = 0.0;
+int mode = 1;                   // 0=Low, 1=Medium, 2=High
+const double modes[] = {50.0, 55.0, 60.0};
+
+// ====== PID PARAMETERS ======
+double Kp = 5.0;
+double Ki = 0.8;
+double Kd = 2.5;
+
+// ====== PID STATE VARIABLES ======
+double prevError = 0.0;
+double integral = 0.0;
+unsigned long lastTime = 0;
+
+// ====== BUTTON DEBOUNCE ======
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(HEATER_PWM_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  sensors.begin();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  lastTime = millis();
+}
+
+void loop() {
+  // === BUTTON HANDLING ===
+  bool reading = digitalRead(BUTTON_PIN);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW && lastButtonState == HIGH) {
+      mode = (mode + 1) % 3;
+      setpoint = modes[mode];
+    }
+  }
+  lastButtonState = reading;
+
+  // === READ TEMPERATURE ===
+  sensors.requestTemperatures();
+  currentTemp = sensors.getTempCByIndex(0);
+  if (currentTemp == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Sensor not detected");
+    delay(1000);
+    return;
+  }
+
+  // === PID CALCULATION ===
+  double error = setpoint - currentTemp;
+  unsigned long now = millis();
+  double deltaTime = (now - lastTime) / 1000.0;
+
+  if (deltaTime >= 0.5) {
+    integral += error * deltaTime;
+    integral = constrain(integral, -255.0 / Ki, 255.0 / Ki);
+    double derivative = (error - prevError) / deltaTime;
+
+    pwmOutput = Kp * error + Ki * integral + Kd * derivative;
+    pwmOutput = constrain(pwmOutput, 0, 255);
+
+    prevError = error;
+    lastTime = now;
+  }
+
+  analogWrite(HEATER_PWM_PIN, (int)pwmOutput);
+
+  // === DISPLAY OUTPUT ===
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Temp: ");
+  display.print(currentTemp, 1);
+  display.println(" C");
+
+  display.print("Setpoint: ");
+  display.print(setpoint, 0);
+  display.println(" C");
+
+  display.print("Mode: ");
+  if (mode == 0) display.println("Low");
+  else if (mode == 1) display.println("Medium");
+  else display.println("High");
+
+  display.print("PWM: ");
+  display.println((int)pwmOutput);
+
+  display.display();
+
+  // === SERIAL DEBUG ===
+  Serial.print("Mode: ");
+  Serial.print(mode == 0 ? "Low" : (mode == 1 ? "Medium" : "High"));
+  Serial.print(" | Setpoint: ");
+  Serial.print(setpoint);
+  Serial.print(" C | Temp: ");
+  Serial.print(currentTemp);
+  Serial.print(" C | PWM: ");
+  Serial.println((int)pwmOutput);
+
+  delay(500);
+}
 
